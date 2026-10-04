@@ -1,0 +1,46 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build output
+build/
+dist/
+*.egg-info/
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# Local secrets
+.env
+.env.*
+*.key
+*.pem
+
+# SentryLite generated training dataset
+dataset/
+
+# Generated model files
+models/*.npz
