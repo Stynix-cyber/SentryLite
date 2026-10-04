@@ -42,18 +42,7 @@ def call_name(node: ast.AST) -> str:
 
 
 def attribute_name(node: ast.AST) -> str | None:
-    """
-    Convert a simple attribute chain into a stable name.
-
-    Examples:
-        request.value       -> "request.value"
-        config.user.name    -> "config.user.name"
-
-    More complex expressions such as get_request().value are
-    intentionally not handled yet.
-    """
     parts: list[str] = []
-
     current = node
 
     while isinstance(current, ast.Attribute):
@@ -76,6 +65,118 @@ def variables(expression: ast.AST) -> set[str]:
     }
 
 
+class AliasResolver(ast.NodeVisitor):
+    """
+    Collect simple callable/module aliases.
+
+    Examples:
+
+        reader = input
+            reader -> input
+
+        import pickle as p
+            p -> pickle
+
+        from pickle import loads as deserialize
+            deserialize -> pickle.loads
+    """
+
+    def __init__(self) -> None:
+        self.aliases: dict[str, str] = {}
+
+    def visit_Import(
+        self,
+        node: ast.Import,
+    ) -> None:
+
+        for alias in node.names:
+            if alias.asname:
+                self.aliases[alias.asname] = alias.name
+
+        self.generic_visit(node)
+
+    def visit_ImportFrom(
+        self,
+        node: ast.ImportFrom,
+    ) -> None:
+
+        if node.module is None:
+            self.generic_visit(node)
+            return
+
+        for alias in node.names:
+            local_name = alias.asname or alias.name
+            full_name = f"{node.module}.{alias.name}"
+
+            self.aliases[local_name] = full_name
+
+        self.generic_visit(node)
+
+    def visit_Assign(
+        self,
+        node: ast.Assign,
+    ) -> None:
+
+        if isinstance(node.value, ast.Name):
+            source_name = self.resolve(node.value.id)
+
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    self.aliases[target.id] = source_name
+
+        elif isinstance(node.value, ast.Attribute):
+            source_name = self.resolve(
+                call_name(node.value)
+            )
+
+            if source_name:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.aliases[target.id] = source_name
+
+        self.generic_visit(node)
+
+    def resolve(
+        self,
+        name: str,
+    ) -> str:
+
+        if not name:
+            return name
+
+        seen: set[str] = set()
+        current = name
+
+        while current not in seen:
+            seen.add(current)
+
+            direct = self.aliases.get(current)
+
+            if direct is not None:
+                current = direct
+                continue
+
+            parts = current.split(".")
+
+            if not parts:
+                break
+
+            root = parts[0]
+            root_alias = self.aliases.get(root)
+
+            if root_alias is None:
+                break
+
+            if len(parts) == 1:
+                current = root_alias
+            else:
+                current = ".".join(
+                    [root_alias, *parts[1:]]
+                )
+
+        return current
+
+
 class FunctionSummaryBuilder:
 
     SOURCES = {
@@ -83,8 +184,14 @@ class FunctionSummaryBuilder:
         "sys.stdin.readline",
     }
 
-    def __init__(self, tree: ast.AST) -> None:
+    def __init__(
+        self,
+        tree: ast.AST,
+        aliases: AliasResolver,
+    ) -> None:
+
         self.tree = tree
+        self.aliases = aliases
         self.summaries: dict[str, FunctionSummary] = {}
 
     def build(self) -> dict[str, FunctionSummary]:
@@ -211,7 +318,9 @@ class FunctionSummaryBuilder:
                 )
 
                 if isinstance(node.value, ast.Call):
-                    name = call_name(node.value.func)
+                    name = self._resolved_call_name(
+                        node.value.func
+                    )
 
                     summary = self.summaries.get(name)
 
@@ -230,14 +339,18 @@ class FunctionSummaryBuilder:
                         for index in (
                             summary.parameter_to_return
                         ):
-                            if index >= len(
-                                node.value.args
-                            ):
+                            argument = self._argument_for_parameter(
+                                node.value,
+                                summary,
+                                index,
+                            )
+
+                            if argument is None:
                                 continue
 
                             parameter_to_return.update(
                                 self._parameter_sources(
-                                    node.value.args[index],
+                                    argument,
                                     parameter_taint,
                                 )
                             )
@@ -260,7 +373,9 @@ class FunctionSummaryBuilder:
         if not isinstance(expression, ast.Call):
             return None
 
-        name = call_name(expression.func)
+        name = self._resolved_call_name(
+            expression.func
+        )
 
         if name in self.SOURCES:
             return Taint(
@@ -285,6 +400,15 @@ class FunctionSummaryBuilder:
 
         return None
 
+    def _resolved_call_name(
+        self,
+        node: ast.AST,
+    ) -> str:
+
+        return self.aliases.resolve(
+            call_name(node)
+        )
+
     @staticmethod
     def _parameter_sources(
         expression: ast.AST,
@@ -302,6 +426,21 @@ class FunctionSummaryBuilder:
             )
 
         return result
+
+    @staticmethod
+    def _argument_for_parameter(
+        call: ast.Call,
+        summary: FunctionSummary,
+        index: int,
+    ) -> ast.AST | None:
+
+        if index < len(call.args):
+            return call.args[index]
+
+        # FunctionSummary currently stores parameter indexes,
+        # not their names. Keyword arguments are still handled
+        # conservatively elsewhere through variables(expression).
+        return None
 
 
 class DataFlowAnalyzer(ast.NodeVisitor):
@@ -326,25 +465,26 @@ class DataFlowAnalyzer(ast.NodeVisitor):
     def __init__(
         self,
         summaries: dict[str, FunctionSummary],
+        aliases: AliasResolver,
     ) -> None:
 
         self.summaries = summaries
+        self.aliases = aliases
 
-        # Ordinary variable taint:
+        # Ordinary variables:
         #
-        # x = input()
+        # value = input()
         self.tainted: dict[str, Taint] = {}
 
-        # Container taint:
+        # Containers:
         #
         # values.append(input())
-        # data["x"] = input()
+        # data["value"] = input()
         self.tainted_containers: dict[str, Taint] = {}
 
-        # Attribute taint:
+        # Attributes:
         #
         # request.value = input()
-        # config.user.name = input()
         self.tainted_attributes: dict[str, Taint] = {}
 
         self.findings: list[DataFlowFinding] = []
@@ -364,7 +504,6 @@ class DataFlowAnalyzer(ast.NodeVisitor):
 
         for target in node.targets:
 
-            # x = ...
             if isinstance(target, ast.Name):
                 self._assign_name(
                     target.id,
@@ -372,16 +511,12 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                     taint,
                 )
 
-            # values[0] = ...
-            # data["key"] = ...
             elif isinstance(target, ast.Subscript):
                 self._assign_subscript(
                     target,
                     taint,
                 )
 
-            # request.value = ...
-            # config.user.name = ...
             elif isinstance(target, ast.Attribute):
                 self._assign_attribute(
                     target,
@@ -410,19 +545,13 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                 taint,
             )
 
-        elif isinstance(
-            node.target,
-            ast.Subscript,
-        ):
+        elif isinstance(node.target, ast.Subscript):
             self._assign_subscript(
                 node.target,
                 taint,
             )
 
-        elif isinstance(
-            node.target,
-            ast.Attribute,
-        ):
+        elif isinstance(node.target, ast.Attribute):
             self._assign_attribute(
                 node.target,
                 taint,
@@ -445,10 +574,6 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                 None,
             )
 
-        # Reassigning a container creates/replaces its state.
-        #
-        # values = []
-        # data = {}
         if isinstance(
             value,
             (ast.List, ast.Dict, ast.Set, ast.Tuple),
@@ -469,9 +594,6 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                     name
                 ] = literal_taint
 
-        # Alias:
-        #
-        # other = values
         elif isinstance(value, ast.Name):
 
             container_taint = (
@@ -496,10 +618,6 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                 None,
             )
 
-        # If an object variable is completely replaced, attributes
-        # belonging to the old object should not stay tainted.
-        #
-        # request = RequestData()
         self._clear_attributes_for_root(name)
 
     def _assign_subscript(
@@ -534,12 +652,6 @@ class DataFlowAnalyzer(ast.NodeVisitor):
         if taint is not None:
             self.tainted_attributes[name] = taint
         else:
-            # Important:
-            #
-            # request.value = input()
-            # request.value = "fixed"
-            #
-            # The second assignment removes the old taint.
             self.tainted_attributes.pop(
                 name,
                 None,
@@ -573,14 +685,15 @@ class DataFlowAnalyzer(ast.NodeVisitor):
         node: ast.Call,
     ) -> None:
 
-        name = call_name(node.func)
+        raw_name = call_name(node.func)
 
-        # values.append(tainted_value)
-        # values.extend(tainted_values)
-        # values.insert(0, tainted_value)
+        name = self.aliases.resolve(
+            raw_name
+        )
+
         self._handle_container_method(
             node,
-            name,
+            raw_name,
         )
 
         if name in self.SINKS:
@@ -669,7 +782,14 @@ class DataFlowAnalyzer(ast.NodeVisitor):
         sink: str,
     ) -> None:
 
-        for argument in node.args:
+        arguments = list(node.args)
+
+        arguments.extend(
+            keyword.value
+            for keyword in node.keywords
+        )
+
+        for argument in arguments:
 
             taint = self._taint_from_expression(
                 argument
@@ -733,12 +853,21 @@ class DataFlowAnalyzer(ast.NodeVisitor):
         expression: ast.AST,
     ) -> Taint | None:
 
-        # Direct source:
+        # Direct call:
         #
         # input()
+        # reader()
+        # p.loads(...)
+        # deserialize(...)
         if isinstance(expression, ast.Call):
 
-            name = call_name(expression.func)
+            raw_name = call_name(
+                expression.func
+            )
+
+            name = self.aliases.resolve(
+                raw_name
+            )
 
             if name in self.SOURCES:
                 return Taint(
@@ -769,24 +898,30 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                     summary.parameter_to_return
                 ):
 
-                    if index >= len(
+                    if index < len(
                         expression.args
                     ):
-                        continue
-
-                    taint = (
-                        self._taint_from_expression(
-                            expression.args[index]
+                        taint = (
+                            self._taint_from_expression(
+                                expression.args[index]
+                            )
                         )
-                    )
 
-                    if taint is not None:
-                        return taint
+                        if taint is not None:
+                            return taint
 
-        # Attribute lookup:
+            # Conservative propagation through keyword arguments.
+            for keyword in expression.keywords:
+                taint = self._taint_from_expression(
+                    keyword.value
+                )
+
+                if taint is not None:
+                    return taint
+
+        # Attribute:
         #
         # request.value
-        # config.user.name
         if isinstance(
             expression,
             ast.Attribute,
@@ -806,7 +941,7 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                 if taint is not None:
                     return taint
 
-        # Container lookup:
+        # Container:
         #
         # values[0]
         # data["value"]
@@ -830,10 +965,7 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                 if taint is not None:
                     return taint
 
-        # Search attributes nested inside a larger expression:
-        #
-        # f"{request.value}"
-        # request.value + "!"
+        # Attributes nested in larger expressions.
         for node in ast.walk(expression):
 
             if not isinstance(
@@ -917,12 +1049,17 @@ def analyze_dataflow(
 
     tree = ast.parse(source)
 
+    alias_resolver = AliasResolver()
+    alias_resolver.visit(tree)
+
     summaries = FunctionSummaryBuilder(
-        tree
+        tree,
+        aliases=alias_resolver,
     ).build()
 
     analyzer = DataFlowAnalyzer(
-        summaries=summaries
+        summaries=summaries,
+        aliases=alias_resolver,
     )
 
     analyzer.visit(tree)
