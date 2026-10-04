@@ -41,6 +41,33 @@ def call_name(node: ast.AST) -> str:
     return ".".join(reversed(parts))
 
 
+def attribute_name(node: ast.AST) -> str | None:
+    """
+    Convert a simple attribute chain into a stable name.
+
+    Examples:
+        request.value       -> "request.value"
+        config.user.name    -> "config.user.name"
+
+    More complex expressions such as get_request().value are
+    intentionally not handled yet.
+    """
+    parts: list[str] = []
+
+    current = node
+
+    while isinstance(current, ast.Attribute):
+        parts.append(current.attr)
+        current = current.value
+
+    if not isinstance(current, ast.Name):
+        return None
+
+    parts.append(current.id)
+
+    return ".".join(reversed(parts))
+
+
 def variables(expression: ast.AST) -> set[str]:
     return {
         node.id
@@ -314,6 +341,12 @@ class DataFlowAnalyzer(ast.NodeVisitor):
         # data["x"] = input()
         self.tainted_containers: dict[str, Taint] = {}
 
+        # Attribute taint:
+        #
+        # request.value = input()
+        # config.user.name = input()
+        self.tainted_attributes: dict[str, Taint] = {}
+
         self.findings: list[DataFlowFinding] = []
 
     # ---------------------------------------------------------
@@ -342,15 +375,18 @@ class DataFlowAnalyzer(ast.NodeVisitor):
             # values[0] = ...
             # data["key"] = ...
             elif isinstance(target, ast.Subscript):
-                container_name = self._container_name(
-                    target
+                self._assign_subscript(
+                    target,
+                    taint,
                 )
 
-                if container_name is not None:
-                    if taint is not None:
-                        self.tainted_containers[
-                            container_name
-                        ] = taint
+            # request.value = ...
+            # config.user.name = ...
+            elif isinstance(target, ast.Attribute):
+                self._assign_attribute(
+                    target,
+                    taint,
+                )
 
         self.generic_visit(node)
 
@@ -378,17 +414,19 @@ class DataFlowAnalyzer(ast.NodeVisitor):
             node.target,
             ast.Subscript,
         ):
-            container_name = self._container_name(
-                node.target
+            self._assign_subscript(
+                node.target,
+                taint,
             )
 
-            if (
-                container_name is not None
-                and taint is not None
-            ):
-                self.tainted_containers[
-                    container_name
-                ] = taint
+        elif isinstance(
+            node.target,
+            ast.Attribute,
+        ):
+            self._assign_attribute(
+                node.target,
+                taint,
+            )
 
         self.generic_visit(node)
 
@@ -454,6 +492,74 @@ class DataFlowAnalyzer(ast.NodeVisitor):
 
         else:
             self.tainted_containers.pop(
+                name,
+                None,
+            )
+
+        # If an object variable is completely replaced, attributes
+        # belonging to the old object should not stay tainted.
+        #
+        # request = RequestData()
+        self._clear_attributes_for_root(name)
+
+    def _assign_subscript(
+        self,
+        target: ast.Subscript,
+        taint: Taint | None,
+    ) -> None:
+
+        container_name = self._container_name(
+            target
+        )
+
+        if container_name is None:
+            return
+
+        if taint is not None:
+            self.tainted_containers[
+                container_name
+            ] = taint
+
+    def _assign_attribute(
+        self,
+        target: ast.Attribute,
+        taint: Taint | None,
+    ) -> None:
+
+        name = attribute_name(target)
+
+        if name is None:
+            return
+
+        if taint is not None:
+            self.tainted_attributes[name] = taint
+        else:
+            # Important:
+            #
+            # request.value = input()
+            # request.value = "fixed"
+            #
+            # The second assignment removes the old taint.
+            self.tainted_attributes.pop(
+                name,
+                None,
+            )
+
+    def _clear_attributes_for_root(
+        self,
+        root: str,
+    ) -> None:
+
+        prefix = root + "."
+
+        stale = [
+            name
+            for name in self.tainted_attributes
+            if name.startswith(prefix)
+        ]
+
+        for name in stale:
+            self.tainted_attributes.pop(
                 name,
                 None,
             )
@@ -572,12 +678,8 @@ class DataFlowAnalyzer(ast.NodeVisitor):
             if taint is None:
                 continue
 
-            used_variables = variables(argument)
-
-            variable = (
-                sorted(used_variables)[0]
-                if used_variables
-                else "<expression>"
+            variable = self._expression_label(
+                argument
             )
 
             self.findings.append(
@@ -593,6 +695,34 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                     sink=sink,
                 )
             )
+
+    @staticmethod
+    def _expression_label(
+        expression: ast.AST,
+    ) -> str:
+
+        if isinstance(expression, ast.Name):
+            return expression.id
+
+        if isinstance(expression, ast.Attribute):
+            name = attribute_name(expression)
+
+            if name is not None:
+                return name
+
+        if isinstance(expression, ast.Subscript):
+            if isinstance(
+                expression.value,
+                ast.Name,
+            ):
+                return expression.value.id
+
+        used_variables = variables(expression)
+
+        if used_variables:
+            return sorted(used_variables)[0]
+
+        return "<expression>"
 
     # ---------------------------------------------------------
     # Taint resolution
@@ -653,6 +783,29 @@ class DataFlowAnalyzer(ast.NodeVisitor):
                     if taint is not None:
                         return taint
 
+        # Attribute lookup:
+        #
+        # request.value
+        # config.user.name
+        if isinstance(
+            expression,
+            ast.Attribute,
+        ):
+
+            name = attribute_name(
+                expression
+            )
+
+            if name is not None:
+                taint = (
+                    self.tainted_attributes.get(
+                        name
+                    )
+                )
+
+                if taint is not None:
+                    return taint
+
         # Container lookup:
         #
         # values[0]
@@ -676,6 +829,30 @@ class DataFlowAnalyzer(ast.NodeVisitor):
 
                 if taint is not None:
                     return taint
+
+        # Search attributes nested inside a larger expression:
+        #
+        # f"{request.value}"
+        # request.value + "!"
+        for node in ast.walk(expression):
+
+            if not isinstance(
+                node,
+                ast.Attribute,
+            ):
+                continue
+
+            name = attribute_name(node)
+
+            if name is None:
+                continue
+
+            taint = self.tainted_attributes.get(
+                name
+            )
+
+            if taint is not None:
+                return taint
 
         # Ordinary variables / nested expressions.
         for variable in variables(expression):
